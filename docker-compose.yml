@@ -1,0 +1,28 @@
+services:
+  handoff-chain:
+    build: .
+    image: handoff-chain:latest
+    container_name: handoff-chain
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      PORT: "8000"
+      # 审计翻页游标的 HMAC 签名密钥：此处仅为**开发默认值**，保证一键启动；
+      # 生产部署必须在环境或 .env 中覆盖为强随机值（如 openssl rand -hex 32）。
+      AUDIT_CURSOR_SECRET: ${AUDIT_CURSOR_SECRET:-dev-only-audit-cursor-secret-change-me}
+    volumes:
+      - handoff-data:/data
+      # 数据库归档（python -m app.backup create <目录>）的默认存放卷
+      - handoff-backups:/backups
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  handoff-data:
+  handoff-backups:

@@ -15,10 +15,18 @@ create —— 用 SQLite 在线备份机制（backup API）为 DB_PATH 生成一
   * 任一步失败即清理暂存目录，不改动源库与任何既有归档。
 
 verify —— 只读核验既有归档（不触碰源库，可离线运行）：
+  * 归档目录本身必须是普通目录，目录内的清单与清单所列文件必须是普通文件：
+    目录、清单或任何条目为符号链接一律拒绝（符号链接可指向归档外的同字节
+    文件，外部文件移走后归档即失效，并非自包含归档）；
+  * 目录与各文件分别以 O_NOFOLLOW 的 open/openat 固定 inode 后才读取，
+    核验期间路径被替换（rename）不会改变正在读取的对象；
+  * 每个文件经单遍读取同步完成 SHA-256 计算与大小核对；数据库文件还会在
+    同一次读取中固化到核验方私有的临时副本（0700 目录、0600 文件），
+    integrity_check、foreign_key_check 与五张业务表结构检查只对这份副本
+    执行——摘要与库级检查锚定同一份已固定的字节内容，核验期间路径替换或
+    文件被原地截断/改写都无法把两阶段结果拼成“通过”；
   * 解析并校验清单（格式、版本、必备条目），逐一重算清单内文件的
     SHA-256 并比对大小，拒绝清单之外的文件；
-  * 对归档内数据库只读执行 integrity_check、foreign_key_check 与五张业务表
-    结构校验（基准为当前代码 database 模块建出的参考结构）；
   * 全部通过退出码 0；任何损坏/缺项以非零退出码退出并在 stderr 列出具体原因。
 """
 from __future__ import annotations
@@ -32,6 +40,7 @@ import os
 import platform
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -71,6 +80,59 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+# ---- 核验期的 inode 固定与单遍固化 ----------------------------------------
+#
+# “先 stat/哈希、再按路径打开做 SQLite 检查”存在两扇窗口：路径可在两次打开
+# 之间被符号链接/rename 替换到归档外的同字节文件（TOCTOU）；即便不替换路径，
+# 文件内容也可在两阶段之间被原地改写。因此核验对每个文件只做一次打开：
+# openat(dir_fd, name, O_RDONLY|O_NOFOLLOW) 固定普通文件的 inode（符号链接
+# 直接 ELOOP），随后在同一次顺序读取中同步完成 SHA-256、大小核对；数据库
+# 文件在这同一次读取中固化到核验方私有的临时副本，库级检查只针对副本进行，
+# 摘要与库级检查因此锚定同一份已固定的字节内容。
+
+_OPEN_NOFOLLOW_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+_OPEN_DIR_NOFOLLOW_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(
+    os, "O_NOFOLLOW", 0
+)
+
+
+def _hash_pinned_file(
+    fd: int, want_size: int, sink: str | Path | None = None
+) -> tuple[str, int]:
+    """对已固定 inode 的打开文件做单遍顺序读取。
+
+    读取过程中同步更新 SHA-256、累计字节数；sink 给定时把同一份字节写入
+    （用于数据库文件的私有副本固化）。返回 (sha256, 实读字节数)。
+    调用方保证读取期间持有 fd，路径替换或文件被 unlink 都不影响本次读取。
+    """
+    digest = hashlib.sha256()
+    total = 0
+    if sink is not None:
+        # 私有副本仅属主可读写（忽略 umask）
+        out = open(
+            sink,
+            "wb",
+            opener=lambda p, flags: os.open(p, flags, 0o600),
+        )
+    else:
+        out = None
+    try:
+        for chunk in iter(lambda: os.read(fd, 1024 * 1024), b""):
+            digest.update(chunk)
+            total += len(chunk)
+            if out is not None:
+                out.write(chunk)
+    finally:
+        if out is not None:
+            out.close()
+    if total != want_size:
+        raise BackupError(
+            f"文件在核验过程中大小发生变化（固定时 {want_size} 字节，"
+            f"实读 {total} 字节），拒绝拼装核验结果"
+        )
+    return digest.hexdigest(), total
 
 
 def _online_backup(source: Path, dest: Path) -> None:
@@ -317,87 +379,216 @@ def create_archive(target: Path) -> dict:
 
 
 def verify_archive(target: Path) -> list[str]:
-    """只读核验归档目录，返回问题列表（空列表表示通过）。"""
-    problems: list[str] = []
-    if not target.is_dir():
-        return [f"归档目录不存在或不是目录: {target}"]
-    manifest_path = target / MANIFEST_FILENAME
-    if not manifest_path.is_file():
-        return [f"缺少清单文件: {manifest_path}"]
+    """只读核验归档目录，返回问题列表（空列表表示通过）。
+
+    全程固定 inode：归档目录与每个条目都以 O_NOFOLLOW 的 open/openat 固定后
+    才读取，符号链接一律拒绝；数据库经单遍读取固化到私有临时副本后再做
+    库级检查，摘要与库级检查基于同一份已固定的字节内容。
+    """
+    # 1) 归档目录本身必须是普通目录（拒绝符号链接与其他非目录）
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return [f"清单文件无法解析: {exc}"]
-    if not isinstance(manifest, dict):
-        return ["清单格式非法：顶层不是 JSON 对象"]
+        lst = target.lstat()
+    except OSError as exc:
+        return [f"归档目录不存在或无法访问: {target}: {exc}"]
+    if stat.S_ISLNK(lst.st_mode):
+        return [f"归档目录本身是符号链接，拒绝核验（归档必须为普通目录）: {target}"]
+    if not stat.S_ISDIR(lst.st_mode):
+        return [f"归档目录不存在或不是目录: {target}"]
 
-    if manifest.get("format") != ARCHIVE_FORMAT:
-        problems.append(
-            f"清单 format 非法: {manifest.get('format')!r}（期望 {ARCHIVE_FORMAT!r}）"
-        )
-    version = manifest.get("format_version")
-    if version != ARCHIVE_FORMAT_VERSION:
-        problems.append(
-            f"不支持的归档格式版本: {version!r}（本工具支持 {ARCHIVE_FORMAT_VERSION}）"
-        )
+    dir_fd: int | None = None
+    staging: Path | None = None
+    try:
+        # 固定归档目录 inode：此后即便目录路径被 rename/替换，本句柄仍指向
+        # 开始核验时的那个目录；O_NOFOLLOW 拒绝最后一级为符号链接
+        try:
+            dir_fd = os.open(target, _OPEN_DIR_NOFOLLOW_FLAGS)
+        except OSError as exc:
+            return [f"归档目录无法打开: {target}: {exc}"]
 
-    files = manifest.get("files")
-    if not isinstance(files, dict) or not files:
-        problems.append("清单缺少 files 文件列表")
-        files = {}
-    if manifest.get("db_file", DB_FILENAME) != DB_FILENAME or DB_FILENAME not in files:
-        problems.append(f"清单缺少数据库文件条目: {DB_FILENAME}")
+        # 2) 一次性枚举目录条目，逐条 lstat 分类；符号链接与非普通文件先拦下。
+        #    仅接受清单与清单所列文件，因此任何非普通文件（子目录、设备文件、
+        #    FIFO、符号链接等）都不能出现在归档内。
+        entries: dict[str, os.stat_result] = {}
+        for entry in os.scandir(dir_fd):
+            try:
+                est = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                return [f"归档条目无法读取属性: {entry.name}: {exc}"]
+            entries[entry.name] = est
+            if stat.S_ISLNK(est.st_mode):
+                return [
+                    f"归档内存在符号链接，拒绝核验（归档必须自包含）: {entry.name}"
+                ]
+        if MANIFEST_FILENAME not in entries:
+            return [f"缺少清单文件: {target / MANIFEST_FILENAME}"]
+        if not stat.S_ISREG(entries[MANIFEST_FILENAME].st_mode):
+            return [f"清单不是普通文件: {MANIFEST_FILENAME}"]
 
-    verified_names = set()
-    db_digest_ok = False
-    for name, meta in files.items():
-        if not isinstance(name, str) or not name or Path(name).name != name:
-            problems.append(f"清单包含非法文件名: {name!r}")
-            continue
-        verified_names.add(name)
-        file_path = target / name
-        if not file_path.is_file():
-            problems.append(f"清单文件缺失: {name}")
-            continue
-        if not isinstance(meta, dict):
-            problems.append(f"清单中 {name} 的条目非法（应为对象）")
-            continue
-        want_sha = meta.get("sha256")
-        if not (
-            isinstance(want_sha, str)
-            and len(want_sha) == 64
-            and all(ch in _HEX for ch in want_sha)
+        # 3) 经固定目录句柄以 O_NOFOLLOW 打开清单并读入（拒绝符号链接竞态）
+        try:
+            mf = os.open(
+                MANIFEST_FILENAME, _OPEN_NOFOLLOW_FLAGS, dir_fd=dir_fd
+            )
+        except OSError as exc:
+            return [f"清单文件无法打开: {MANIFEST_FILENAME}: {exc}"]
+        try:
+            mst = os.fstat(mf)
+            if not stat.S_ISREG(mst.st_mode):
+                return [f"清单不是普通文件: {MANIFEST_FILENAME}"]
+            manifest_data = b""
+            for chunk in iter(lambda: os.read(mf, 1024 * 1024), b""):
+                manifest_data += chunk
+        finally:
+            os.close(mf)
+        try:
+            manifest = json.loads(manifest_data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return [f"清单文件无法解析: {exc}"]
+        if not isinstance(manifest, dict):
+            return ["清单格式非法：顶层不是 JSON 对象"]
+
+        problems: list[str] = []
+        if manifest.get("format") != ARCHIVE_FORMAT:
+            problems.append(
+                f"清单 format 非法: {manifest.get('format')!r}"
+                f"（期望 {ARCHIVE_FORMAT!r}）"
+            )
+        version = manifest.get("format_version")
+        if version != ARCHIVE_FORMAT_VERSION:
+            problems.append(
+                f"不支持的归档格式版本: {version!r}"
+                f"（本工具支持 {ARCHIVE_FORMAT_VERSION}）"
+            )
+
+        files = manifest.get("files")
+        if not isinstance(files, dict) or not files:
+            problems.append("清单缺少 files 文件列表")
+            files = {}
+        if (
+            manifest.get("db_file", DB_FILENAME) != DB_FILENAME
+            or DB_FILENAME not in files
         ):
-            problems.append(f"清单中 {name} 的 sha256 字段非法: {want_sha!r}")
-            continue
-        want_size = meta.get("size")
-        if want_size is not None and file_path.stat().st_size != want_size:
-            problems.append(
-                f"文件大小不匹配: {name}: "
-                f"清单 {want_size}, 实际 {file_path.stat().st_size}"
-            )
-            continue
-        got_sha = _sha256_file(file_path)
-        if got_sha != want_sha:
-            problems.append(
-                f"文件 SHA-256 不匹配: {name}: 清单 {want_sha}, 实际 {got_sha}"
-            )
-            continue
-        if name == DB_FILENAME:
-            db_digest_ok = True
+            problems.append(f"清单缺少数据库文件条目: {DB_FILENAME}")
 
-    extras = sorted(
-        entry.name
-        for entry in target.iterdir()
-        if entry.name not in verified_names and entry.name != MANIFEST_FILENAME
-    )
-    if extras:
-        problems.append(f"存在清单之外的文件: {', '.join(extras)}")
+        # 私有暂存目录：数据库文件固化副本的存放处（核验结束即删除）
+        staging = Path(
+            tempfile.mkdtemp(prefix="handoff-verify-", dir=None)
+        )
+        os.chmod(staging, 0o700)
+        db_pinned_copy: Path | None = None
 
-    # 数据库文件摘要一致才执行库级检查；摘要不符已作为具体问题报告
-    if db_digest_ok:
-        problems.extend(_run_db_checks(target / DB_FILENAME))
-    return problems
+        verified_names = set()
+        db_digest_ok = False
+        for name, meta in files.items():
+            if not isinstance(name, str) or not name or Path(name).name != name:
+                problems.append(f"清单包含非法文件名: {name!r}")
+                continue
+            verified_names.add(name)
+            est = entries.get(name)
+            if est is None:
+                problems.append(f"清单文件缺失: {name}")
+                continue
+            if not stat.S_ISREG(est.st_mode):
+                problems.append(
+                    f"清单所列文件不是普通文件（归档内不允许符号链接/目录等）: {name}"
+                )
+                continue
+            if not isinstance(meta, dict):
+                problems.append(f"清单中 {name} 的条目非法（应为对象）")
+                continue
+            want_sha = meta.get("sha256")
+            if not (
+                isinstance(want_sha, str)
+                and len(want_sha) == 64
+                and all(ch in _HEX for ch in want_sha)
+            ):
+                problems.append(f"清单中 {name} 的 sha256 字段非法: {want_sha!r}")
+                continue
+            want_size = meta.get("size")
+            if want_size is not None and (
+                not isinstance(want_size, int)
+                or isinstance(want_size, bool)
+                or want_size < 0
+            ):
+                problems.append(f"清单中 {name} 的 size 字段非法: {want_size!r}")
+                continue
+            fixed_size = est.st_size
+            if want_size is not None and fixed_size != want_size:
+                problems.append(
+                    f"文件大小不匹配: {name}: 清单 {want_size}, 实际 {fixed_size}"
+                )
+                continue
+
+            # 经固定目录句柄打开此文件：O_NOFOLLOW 拒绝符号链接竞态；打开后
+            # inode 固定，单遍读取同步算摘要（数据库还同步固化私有副本）。
+            try:
+                fd = os.open(name, _OPEN_NOFOLLOW_FLAGS, dir_fd=dir_fd)
+            except OSError as exc:
+                problems.append(f"清单文件无法打开: {name}: {exc}")
+                continue
+            try:
+                fst = os.fstat(fd)
+                if not stat.S_ISREG(fst.st_mode):
+                    problems.append(f"清单所列文件不是普通文件: {name}")
+                    continue
+                if fst.st_size != fixed_size:
+                    # lstat 与 open 之间条目被替换：以“已固定 inode”的大小为准
+                    # 复核清单，杜绝两阶段之间换入同路径不同文件
+                    if want_size is not None and fst.st_size != want_size:
+                        problems.append(
+                            f"文件大小不匹配: {name}: 清单 {want_size}, "
+                            f"实际 {fst.st_size}"
+                        )
+                    else:
+                        problems.append(
+                            f"文件在核验过程中被替换（大小 {fixed_size} -> "
+                            f"{fst.st_size}），拒绝核验: {name}"
+                        )
+                    continue
+                # sink 由 _hash_pinned_file 以 0600 新建，写入的就是本次摘要
+                # 所用的同一批字节
+                sink = staging / DB_FILENAME if name == DB_FILENAME else None
+                try:
+                    got_sha, got_size = _hash_pinned_file(fd, fixed_size, sink)
+                except BackupError as exc:
+                    problems.append(str(exc))
+                    continue
+            finally:
+                os.close(fd)
+            if got_size != fixed_size:  # 兜底：理论上 _hash_pinned_file 已拦
+                problems.append(
+                    f"文件大小在读取中发生变化: {name}: "
+                    f"{fixed_size} -> {got_size}"
+                )
+                continue
+            if got_sha != want_sha:
+                problems.append(
+                    f"文件 SHA-256 不匹配: {name}: 清单 {want_sha}, 实际 {got_sha}"
+                )
+                continue
+            if name == DB_FILENAME:
+                db_digest_ok = True
+                db_pinned_copy = sink
+
+        extras = sorted(
+            name
+            for name in entries
+            if name not in verified_names and name != MANIFEST_FILENAME
+        )
+        if extras:
+            problems.append(f"存在清单之外的文件: {', '.join(extras)}")
+
+        # 4) 库级检查只对“摘要所用同一批字节”的私有副本执行：检查期间即便
+        #    归档路径被替换、条目被改写，也检查不到归档之外或另一份内容。
+        if db_digest_ok:
+            assert db_pinned_copy is not None
+            problems.extend(_run_db_checks(db_pinned_copy))
+        return problems
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def main(argv: list[str] | None = None) -> int:
